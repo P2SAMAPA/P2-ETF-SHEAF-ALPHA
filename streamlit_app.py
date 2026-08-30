@@ -4,6 +4,7 @@ import numpy as np
 import requests
 import json
 import glob
+import os
 import networkx as nx
 from datetime import datetime
 import plotly.graph_objects as go
@@ -84,24 +85,68 @@ st.markdown(f"""
 # ----------------------------------------------------------------------------
 # Data loading
 # ----------------------------------------------------------------------------
-def load_data():
+RESULTS_REPO = "P2SAMAPA/p2-sheaf-alpha-results"
+
+
+def _find_latest_hf_result(repo_id: str):
+    """List actual files in the HF dataset and return the newest results
+    file by name (YYYY-MM-DD sorts correctly lexically), instead of
+    guessing that today's date matches when the training run happened."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        files = api.list_repo_files(repo_id, repo_type="dataset")
+        result_files = sorted(f for f in files if f.startswith("sheaf_results_") and f.endswith(".json"))
+        if not result_files:
+            return None, f"No sheaf_results_*.json files found in {repo_id}."
+        return result_files[-1], None
+    except Exception as e:
+        return None, f"Could not list files in {repo_id}: {e}"
+
+
+@st.cache_data(show_spinner="Loading results...")
+def load_data(_cache_key: str = ""):
+    """
+    Load the latest results, trying in order:
+      1. A local sheaf_results_*.json in the working directory (fast path
+         right after running trainer.py locally).
+      2. The most recent sheaf_results_*.json actually present in the HF
+         results dataset (not a guess at "today's" date -- training may
+         have run on a different day than this dashboard is being viewed).
+    Returns (data, notes) where notes is a list of human-readable strings
+    describing what was tried, so a failure is diagnosable instead of a
+    silent blank dashboard.
+    """
+    notes = []
+
     json_files = glob.glob("sheaf_results_*.json")
     if json_files:
-        latest = sorted(json_files)[-1]
-        with open(latest, "r") as f:
-            return json.load(f)
+        latest_local = sorted(json_files)[-1]
+        try:
+            with open(latest_local, "r") as f:
+                return json.load(f), [f"Loaded local file: {latest_local}"]
+        except Exception as e:
+            notes.append(f"Found local file {latest_local} but couldn't parse it: {e}")
 
-    try:
-        repo_id = "P2SAMAPA/p2-sheaf-alpha-results"
-        today = datetime.now().strftime("%Y-%m-%d")
-        url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/sheaf_results_{today}.json"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            return response.json()
-    except Exception:
-        pass
+    latest_remote, list_err = _find_latest_hf_result(RESULTS_REPO)
+    if list_err:
+        notes.append(list_err)
+    else:
+        try:
+            url = f"https://huggingface.co/datasets/{RESULTS_REPO}/resolve/main/{latest_remote}"
+            headers = {}
+            token = os.environ.get("HF_TOKEN")
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                return response.json(), [f"Loaded from HF dataset: {latest_remote}"]
+            notes.append(f"Fetching {latest_remote} from HF returned HTTP {response.status_code} "
+                         f"(private dataset without a valid HF_TOKEN would show up this way).")
+        except Exception as e:
+            notes.append(f"Fetching {latest_remote} from HF failed: {e}")
 
-    return None
+    return None, notes
 
 
 def conf_color(confidence: str) -> str:
@@ -251,19 +296,44 @@ def render_window_comparison(df_results, best_idx, key):
 # Main
 # ----------------------------------------------------------------------------
 def main():
-    data = load_data()
+    if "cache_bust" not in st.session_state:
+        st.session_state.cache_bust = 0
 
-    st.markdown('<div class="app-header"><span style="font-size:1.9rem;">🕸️</span>'
-                 '<span class="app-title">P2 Sheaf-Alpha</span></div>', unsafe_allow_html=True)
-    st.markdown('<div class="app-subtitle">Financial inconsistency alpha via cellular sheaves over ETF & macro relationships</div>',
-                unsafe_allow_html=True)
+    header_col, refresh_col = st.columns([5, 1])
+    with header_col:
+        st.markdown('<div class="app-header"><span style="font-size:1.9rem;">🕸️</span>'
+                     '<span class="app-title">P2 Sheaf-Alpha</span></div>', unsafe_allow_html=True)
+        st.markdown('<div class="app-subtitle">Financial inconsistency alpha via cellular sheaves over ETF & macro relationships</div>',
+                    unsafe_allow_html=True)
+    with refresh_col:
+        st.markdown("<div style='margin-top: 0.6rem;'></div>", unsafe_allow_html=True)
+        if st.button("🔄 Refresh data", use_container_width=True,
+                      help="Clear the cache and re-check for the latest results"):
+            st.cache_data.clear()
+            st.session_state.cache_bust += 1
+            st.rerun()
+
+    data, notes = load_data(_cache_key=str(st.session_state.cache_bust))
 
     if not data:
-        st.error("No data available. Run `python trainer.py` first to generate results.")
+        st.error("No results found.")
+        with st.expander("Why? (click for details)", expanded=True):
+            if notes:
+                for n in notes:
+                    st.write(f"• {n}")
+            else:
+                st.write("• No diagnostic information was returned.")
+            st.write(
+                "Run `python trainer.py` to generate a local `sheaf_results_*.json`, "
+                "or confirm the HF dataset repo has a results file and (if private) "
+                "that `HF_TOKEN` is set in this app's environment. Then hit **🔄 Refresh data** above."
+            )
         return
 
     run_date = data.get("run_date", "Unknown")
     st.caption(f"🕒 Results generated: **{run_date}**")
+    if notes:
+        st.caption(f"📡 {notes[0]}")
 
     tab1, tab2 = st.tabs(["🔮 Live Signal", "🕸️ Sheaf Diagnostics & Backtest"])
 
