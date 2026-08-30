@@ -476,11 +476,47 @@ def main():
                     energy_series = window_results.get(best_window_val, {}).get("energy_series", [])
                 render_energy_chart(energy_series, key=f"{universe}")
 
+            best_window_result = window_results.get(best_window_val) or window_results.get(int(best_window_val)) or {}
+            hp_search = best_window_result.get("hyperparam_search", [])
+            if hp_search:
+                st.markdown("###### Sheaf hyperparameter search (best window)")
+                st.caption(
+                    f"k_neighbors / min_abs_corr were searched over {len(hp_search)} combinations for the "
+                    f"{best_window_val}d window; the winner is highlighted. "
+                    f"⚠️ Testing more combinations raises the chance the 'best' one just got lucky — "
+                    f"if the winner isn't clearly ahead of the rest, treat its edge as noise."
+                )
+                hp_df = pd.DataFrame(hp_search)
+                winner_mask = (
+                    (hp_df["k_neighbors"] == best_window_result.get("k_neighbors"))
+                    & (hp_df["min_abs_corr"] == best_window_result.get("min_abs_corr"))
+                )
+                winner_idx = hp_df[winner_mask].index[0] if winner_mask.any() else None
+                st.dataframe(
+                    hp_df.style.apply(
+                        lambda x: ["background-color: #ede9fe" if x.name == winner_idx else "" for _ in x],
+                        axis=1,
+                    ).format({"correlation": "{:.4f}", "sharpe": "{:.2f}", "n_predictions": "{:,.0f}"}),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "k_neighbors": "k neighbors",
+                        "min_abs_corr": "min |corr|",
+                        "correlation": "Correlation",
+                        "sharpe": "Sharpe",
+                        "n_predictions": "Predictions",
+                    },
+                )
+
             st.markdown("###### Sheaf network — strongest restriction maps (best window)")
             uni_diag = diagnostics.get(universe, {})
             best_diag = uni_diag.get(best_window_val) or uni_diag.get(int(best_window_val)) or {}
             ticker_set = set(data.get("universes", {}).get(universe, {}).get("tickers", []))
             render_network_graph(best_diag.get("top_edges", []), ticker_set, key=f"{universe}")
+            if best_diag.get("k_neighbors_used") is not None:
+                st.caption(f"Built with k_neighbors={best_diag['k_neighbors_used']}, "
+                           f"min_abs_corr={best_diag['min_abs_corr_used']} "
+                           f"(the combination that won this window's hyperparameter search above).")
 
             st.markdown("###### ETF picks by window")
             universe_window_picks = window_picks.get(universe, {})

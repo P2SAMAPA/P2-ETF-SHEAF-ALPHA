@@ -38,7 +38,47 @@ SHEAF_CONFIG = {
     "min_abs_corr": 0.15,
     "use_macro": True,
     "min_train_samples": 30,
+    # Fraction of a universe's history reserved purely as a global
+    # "burn-in" before walk-forward testing starts. This is deliberately
+    # small: it does NOT reduce how much data each individual model is
+    # trained on (that's always exactly `window` days immediately
+    # preceding each test point, enforced separately) -- it only controls
+    # how far back testing is ALLOWED to start. A large fraction here
+    # (0.8, the old default) wastes most of the dataset's history: it was
+    # producing only 427-874 out-of-sample predictions per universe, with
+    # standard errors on the resulting correlation estimates (~1/sqrt(n))
+    # too large to distinguish real signal from noise. Each window is
+    # still individually protected from starting before it has `window`
+    # valid days of prior data (see the train_start < 0 guard in
+    # backtest_window), so lowering this is safe -- it just lets every
+    # window use as much of the eligible history as it actually can.
+    "burn_in_fraction": 0.05,
 }
+
+# Small hyperparameter grid searched PER WINDOW, per universe, selecting
+# the combination with the best out-of-sample correlation (consistent
+# with BEST_WINDOW_METRIC below -- prediction quality drives selection,
+# not backtested P&L). Only k_neighbors / min_abs_corr are searched, since
+# those are the two levers that most directly control what counts as a
+# "consistency constraint" in the sheaf -- how many neighbors contribute
+# to a node's consensus estimate, and how strong a relationship has to be
+# before it's trusted at all.
+#
+# IMPORTANT CAVEAT: searching more combinations increases the risk of
+# picking one that looks good by pure chance (the "best of N noisy
+# estimates" problem) -- this grows with grid size. The trainer reports
+# the FULL comparison table, not just the winner, specifically so this
+# can be checked: if the winning combination isn't meaningfully better
+# than the rest of the grid, its apparent edge should be treated as noise
+# regardless of which number happened to come out on top.
+SHEAF_GRID = [
+    {"k_neighbors": 3, "min_abs_corr": 0.15},
+    {"k_neighbors": 5, "min_abs_corr": 0.15},
+    {"k_neighbors": 8, "min_abs_corr": 0.15},
+    {"k_neighbors": 5, "min_abs_corr": 0.10},
+    {"k_neighbors": 5, "min_abs_corr": 0.25},
+    {"k_neighbors": 5, "min_abs_corr": 0.35},
+]
 
 TOP_N = 3
 

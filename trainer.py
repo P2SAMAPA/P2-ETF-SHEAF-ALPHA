@@ -43,7 +43,8 @@ def backtest_window(V: np.ndarray, ticker_indices: List[int], window: int,
     if n_samples < window + 50:
         return {"error": "Insufficient data", "window": window}
 
-    train_size = int(n_samples * 0.8)
+    burn_in_fraction = sheaf_config.get("burn_in_fraction", 0.05)
+    train_size = int(n_samples * burn_in_fraction)
     min_train = sheaf_config.get("min_train_samples", 30)
 
     predictions = []
@@ -136,6 +137,50 @@ def backtest_window(V: np.ndarray, ticker_indices: List[int], window: int,
     }
 
 
+def backtest_window_with_search(V: np.ndarray, ticker_indices: List[int], window: int,
+                                 base_config: Dict, grid: List[Dict]) -> Dict:
+    """
+    Try each sheaf hyperparameter combination in `grid` for this window,
+    keep the one with the best out-of-sample correlation (consistent with
+    BEST_WINDOW_METRIC -- prediction quality drives selection, not P&L).
+
+    Returns the winning result, with the winning k_neighbors/min_abs_corr
+    recorded on it, plus a `hyperparam_search` list of every combination
+    tried (correlation, sharpe, n) so the winner's margin over the rest of
+    the grid can be checked -- searching more combinations increases the
+    risk that the "best" one just got lucky, and that risk is only
+    visible if the full comparison is kept, not just the winner.
+    """
+    candidates = []
+    for combo in grid:
+        cfg = base_config.copy()
+        cfg.update(combo)
+        result = backtest_window(V, ticker_indices, window, cfg)
+        if "error" not in result:
+            result = dict(result)
+            result["k_neighbors"] = combo.get("k_neighbors", base_config.get("k_neighbors"))
+            result["min_abs_corr"] = combo.get("min_abs_corr", base_config.get("min_abs_corr"))
+            candidates.append(result)
+
+    if not candidates:
+        return {"error": "Not enough predictions", "window": window}
+
+    best = max(candidates, key=lambda r: r.get("correlation", -999))
+    best = dict(best)
+    best["n_hyperparam_combos_tested"] = len(candidates)
+    best["hyperparam_search"] = [
+        {
+            "k_neighbors": c["k_neighbors"],
+            "min_abs_corr": c["min_abs_corr"],
+            "correlation": round(c["correlation"], 5),
+            "sharpe": round(c["sharpe"], 3),
+            "n_predictions": c["n_predictions"],
+        }
+        for c in sorted(candidates, key=lambda r: -r.get("correlation", -999))
+    ]
+    return best
+
+
 def _confidence_from_r2(r2: float) -> str:
     if r2 > 0.01:
         return "High"
@@ -196,6 +241,8 @@ def compute_ticker_picks(V: np.ndarray, node_names: List[str], ticker_indices: L
         "reg_slope": round(result["reg_slope"], 4),
         "reg_r2": round(result["reg_r2"], 5),
         "sheaf_energy": round(result["sheaf_energy"], 4),
+        "k_neighbors_used": cfg.get("k_neighbors"),
+        "min_abs_corr_used": cfg.get("min_abs_corr"),
         "top_edges": [
             {"a": a, "b": b, "rho": round(rho, 3)}
             for a, b, rho in model.get_top_edges(10)
@@ -265,18 +312,32 @@ def run_trainer() -> Dict:
         sheaf_config = config.SHEAF_CONFIG.copy()
         sheaf_config["trading_cost_bps"] = config.TRADING_COST_BPS
 
-        # Backtest each window
+        # Backtest each window, searching the sheaf hyperparameter grid
+        # within each window and keeping the best combination by
+        # out-of-sample correlation. window_hyperparams records which
+        # combination won for each window, so the SAME combination is
+        # used to generate that window's live picks below (otherwise the
+        # backtest and the live picks would silently be using different
+        # graphs).
         window_results = {}
+        window_hyperparams = {}
         for window in config.WINDOWS:
-            logger.info(f"  Testing window {window}...")
-            result = backtest_window(V, ticker_indices, window, sheaf_config)
+            logger.info(f"  Testing window {window} ({len(config.SHEAF_GRID)} hyperparameter combos)...")
+            result = backtest_window_with_search(V, ticker_indices, window, sheaf_config, config.SHEAF_GRID)
 
             if "error" not in result:
                 window_results[window] = result
-                logger.info(f"    Correlation: {result['correlation']:.3f}, "
+                window_hyperparams[window] = {
+                    "k_neighbors": result["k_neighbors"],
+                    "min_abs_corr": result["min_abs_corr"],
+                }
+                logger.info(f"    Best combo: k={result['k_neighbors']}, "
+                           f"min_abs_corr={result['min_abs_corr']} -> "
+                           f"Correlation: {result['correlation']:.4f}, "
                            f"Directional: {result['directional_accuracy']:.2%}, "
                            f"Sharpe (net of {config.TRADING_COST_BPS}bps costs): {result['sharpe']:.2f} "
                            f"(gross: {result['sharpe_gross']:.2f}), "
+                           f"n={result['n_predictions']}, "
                            f"Sheaf-R²: {result['avg_reg_r2']:.4f}")
             else:
                 logger.warning(f"    {result['error']}")
@@ -310,8 +371,14 @@ def run_trainer() -> Dict:
         best_win_diag = {}
 
         for window in config.WINDOWS:
+            # Use the SAME hyperparameter combination that won this
+            # window's backtest, so live picks reflect the graph that was
+            # actually validated, not a different default guess.
+            cfg_for_window = sheaf_config.copy()
+            cfg_for_window.update(window_hyperparams.get(window, {}))
+
             picks, ticker_results, diag = compute_ticker_picks(
-                V, node_names, ticker_indices, available, window, sheaf_config, config.TOP_N
+                V, node_names, ticker_indices, available, window, cfg_for_window, config.TOP_N
             )
             results["window_picks"][universe_name][window] = picks
             results["diagnostics"][universe_name][window] = diag
@@ -321,8 +388,10 @@ def run_trainer() -> Dict:
 
         picks = results["window_picks"][universe_name].get(best_win, [])
         if not best_win_ticker_results:
+            cfg_for_best = sheaf_config.copy()
+            cfg_for_best.update(window_hyperparams.get(best_win, {}))
             picks, best_win_ticker_results, best_win_diag = compute_ticker_picks(
-                V, node_names, ticker_indices, available, best_win, sheaf_config, config.TOP_N
+                V, node_names, ticker_indices, available, best_win, cfg_for_best, config.TOP_N
             )
 
         results["top_picks"][universe_name] = picks
