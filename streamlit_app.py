@@ -266,11 +266,11 @@ def render_energy_chart(energy_series, key):
 
 
 def render_window_comparison(df_results, best_idx, key):
-    """Sharpe + directional accuracy across window sizes -- a line chart, not a bar chart."""
+    """Net Sharpe + directional accuracy across window sizes -- a line chart, not a bar chart."""
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df_results["Window"], y=df_results["Sharpe Ratio"],
-        mode="lines+markers", name="Sharpe Ratio",
+        x=df_results["Window"], y=df_results["Net Sharpe"],
+        mode="lines+markers", name="Net Sharpe (after costs)",
         line=dict(color=PRIMARY, width=2.5), marker=dict(size=9),
     ))
     fig.add_trace(go.Scatter(
@@ -283,7 +283,7 @@ def render_window_comparison(df_results, best_idx, key):
         height=320, margin=dict(l=10, r=10, t=30, b=10),
         plot_bgcolor="white", paper_bgcolor="white",
         xaxis=dict(title="Window Size (days)", gridcolor="#eef2f7"),
-        yaxis=dict(title="Sharpe Ratio", gridcolor="#eef2f7"),
+        yaxis=dict(title="Net Sharpe Ratio", gridcolor="#eef2f7"),
         yaxis2=dict(title="Directional Accuracy (%)", overlaying="y", side="right"),
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
@@ -366,9 +366,14 @@ def main():
                 st.markdown(f"""
                 <div class="best-window-banner">
                     ✅ Best training window: <b>{best.get('window', 'N/A')} days</b>
-                    &nbsp;|&nbsp; Sharpe: <b>{metrics.get('sharpe', 0):.2f}</b>
+                    <span style="opacity:0.7;">(selected by return-prediction correlation, not Sharpe)</span>
+                    &nbsp;|&nbsp; Correlation: <b>{metrics.get('correlation', 0):.4f}</b>
                     &nbsp;|&nbsp; Directional accuracy: <b>{metrics.get('directional_accuracy', 0):.1%}</b>
                     &nbsp;|&nbsp; Sheaf R²: <b>{metrics.get('avg_reg_r2', 0):.4f}</b>
+                    <br/>
+                    Net Sharpe (after {metrics.get('trading_cost_bps_assumed', 15)}bps trading cost):
+                    <b>{metrics.get('sharpe', 0):.2f}</b>
+                    <span style="opacity:0.7;">(gross, before costs: {metrics.get('sharpe_gross', 0):.2f})</span>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -401,22 +406,29 @@ def main():
                     "Window": int(w),
                     "Correlation": r.get("correlation", 0),
                     "Directional Accuracy": r.get("directional_accuracy", 0) * 100,
-                    "Sharpe Ratio": r.get("sharpe", 0),
+                    "Net Sharpe": r.get("sharpe", 0),
+                    "Gross Sharpe": r.get("sharpe_gross", 0),
                     "Sheaf R²": r.get("avg_reg_r2", 0),
+                    "Avg Cost (bps/day)": r.get("avg_daily_cost_bps", 0),
                     "Predictions": r.get("n_predictions", 0),
                 }
                 for w, r in window_results.items()
             ]).sort_values("Window").reset_index(drop=True)
 
-            best_idx = df_results["Sharpe Ratio"].idxmax()
+            # Selected by return-prediction correlation (see config.BEST_WINDOW_METRIC),
+            # not by Sharpe -- Sharpe reflects realized P&L, which can look
+            # good from a window whose predictions barely explain anything.
+            best_idx = df_results["Correlation"].idxmax()
             best_row = df_results.loc[best_idx]
             best_window_val = str(int(best_row["Window"]))
+            cost_bps = window_results.get(best_window_val, window_results.get(int(best_window_val), {})).get("trading_cost_bps_assumed", 15)
 
-            kpi_cols = st.columns(4)
+            kpi_cols = st.columns(5)
             kpi_data = [
                 ("Best Window", f"{int(best_row['Window'])}d"),
-                ("Best Sharpe", f"{best_row['Sharpe Ratio']:.2f}"),
+                ("Correlation", f"{best_row['Correlation']:.4f}"),
                 ("Directional Acc.", f"{best_row['Directional Accuracy']:.1f}%"),
+                ("Net Sharpe", f"{best_row['Net Sharpe']:.2f}"),
                 ("Sheaf R²", f"{best_row['Sheaf R²']:.4f}"),
             ]
             for col, (label, value) in zip(kpi_cols, kpi_data):
@@ -428,6 +440,11 @@ def main():
                     </div>
                     """, unsafe_allow_html=True)
 
+            st.caption(f"💸 Net Sharpe/returns above assume a {cost_bps}bps trading cost per position "
+                       f"change (turnover), not a flat per-day charge — a position held unchanged "
+                       f"day-to-day costs nothing extra. Best window highlighted below is chosen by "
+                       f"return-prediction correlation, not by Sharpe.")
+
             st.markdown("<div style='margin-top: 0.9rem;'></div>", unsafe_allow_html=True)
 
             st.dataframe(
@@ -435,10 +452,12 @@ def main():
                     lambda x: ["background-color: #ede9fe" if x.name == best_idx else "" for _ in x],
                     axis=1,
                 ).format({
-                    "Correlation": "{:.3f}",
+                    "Correlation": "{:.4f}",
                     "Directional Accuracy": "{:.1f}%",
-                    "Sharpe Ratio": "{:.2f}",
+                    "Net Sharpe": "{:.2f}",
+                    "Gross Sharpe": "{:.2f}",
                     "Sheaf R²": "{:.4f}",
+                    "Avg Cost (bps/day)": "{:.2f}",
                     "Predictions": "{:,.0f}",
                 }),
                 use_container_width=True,

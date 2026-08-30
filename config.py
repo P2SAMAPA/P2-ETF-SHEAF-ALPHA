@@ -41,3 +41,19 @@ SHEAF_CONFIG = {
 }
 
 TOP_N = 3
+
+# Round-trip trading cost assumption, in basis points, applied to every
+# position change (turnover) in the backtest. 15 bps is a reasonable
+# generic estimate for liquid ETF bid-ask spread + slippage; adjust to
+# match your actual execution costs.
+TRADING_COST_BPS = 15
+
+# How the "best window" per universe is chosen for Tab 1's live picks.
+# "correlation" selects the window whose return PREDICTIONS were most
+# accurate historically (predicted vs. actual return correlation) -- a
+# direct measure of prediction quality. The previous default, "sharpe",
+# reflects backtested P&L, which can be inflated by a window simply
+# riding the test period's market drift even when its predictions barely
+# explain anything (this was observed directly: the highest-Sharpe window
+# for EQUITY_SECTORS had by far the weakest R² of any window tested).
+BEST_WINDOW_METRIC = "correlation"

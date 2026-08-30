@@ -92,12 +92,29 @@ def backtest_window(V: np.ndarray, ticker_indices: List[int], window: int,
     correlation = np.corrcoef(predictions.flatten(), actuals.flatten())[0, 1]
     mse = np.mean((predictions - actuals) ** 2)
 
-    pred_sign = np.sign(predictions.flatten())
-    actual_sign = np.sign(actuals.flatten())
-    directional_accuracy = np.mean(pred_sign == actual_sign)
+    pred_sign = np.sign(predictions)      # (n_steps, n_tickers)
+    actual_sign = np.sign(actuals)
+    directional_accuracy = np.mean(pred_sign.flatten() == actual_sign.flatten())
 
-    returns_strategy = actuals.flatten() * pred_sign
-    sharpe = np.mean(returns_strategy) / (np.std(returns_strategy) + 1e-8) * np.sqrt(252)
+    gross_returns = actuals * pred_sign   # (n_steps, n_tickers), pre-cost
+
+    # Turnover-based trading costs: a cost is only paid when a ticker's
+    # position (long/flat/short, from pred_sign) actually CHANGES from one
+    # day to the next -- not on every day a position is simply held. The
+    # first day is charged as trading in from flat (previous position 0).
+    # cost_bps is applied per unit of position change, so a full flip
+    # (long -> short) costs 2x a simple entry, matching the extra notional
+    # actually traded.
+    cost_bps = sheaf_config.get("trading_cost_bps", 15)
+    prev_position = np.zeros((1, pred_sign.shape[1]))
+    position_history = np.vstack([prev_position, pred_sign])  # (n_steps+1, n_tickers)
+    turnover = np.abs(np.diff(position_history, axis=0))       # (n_steps, n_tickers)
+    trading_cost = (cost_bps / 10000.0) * turnover
+
+    net_returns = gross_returns - trading_cost
+
+    sharpe_gross = np.mean(gross_returns.flatten()) / (np.std(gross_returns.flatten()) + 1e-8) * np.sqrt(252)
+    sharpe_net = np.mean(net_returns.flatten()) / (np.std(net_returns.flatten()) + 1e-8) * np.sqrt(252)
 
     return {
         "window": window,
@@ -105,9 +122,13 @@ def backtest_window(V: np.ndarray, ticker_indices: List[int], window: int,
         "correlation": float(correlation) if not np.isnan(correlation) else 0.0,
         "mse": float(mse),
         "directional_accuracy": float(directional_accuracy),
-        "sharpe": float(sharpe),
-        "mean_return": float(np.mean(returns_strategy)),
-        "std_return": float(np.std(returns_strategy)),
+        "sharpe": float(sharpe_net),
+        "sharpe_gross": float(sharpe_gross),
+        "mean_return": float(np.mean(net_returns.flatten())),
+        "mean_return_gross": float(np.mean(gross_returns.flatten())),
+        "std_return": float(np.std(net_returns.flatten())),
+        "avg_daily_cost_bps": float(np.mean(trading_cost.flatten()) * 10000.0),
+        "trading_cost_bps_assumed": cost_bps,
         "avg_sheaf_energy": float(np.mean(energies)),
         "avg_reg_slope": float(np.mean(slopes)),
         "avg_reg_r2": float(np.mean(r2s)),
@@ -242,6 +263,7 @@ def run_trainer() -> Dict:
 
         ticker_indices = list(range(len(available)))
         sheaf_config = config.SHEAF_CONFIG.copy()
+        sheaf_config["trading_cost_bps"] = config.TRADING_COST_BPS
 
         # Backtest each window
         window_results = {}
@@ -253,19 +275,30 @@ def run_trainer() -> Dict:
                 window_results[window] = result
                 logger.info(f"    Correlation: {result['correlation']:.3f}, "
                            f"Directional: {result['directional_accuracy']:.2%}, "
-                           f"Sharpe: {result['sharpe']:.2f}, "
+                           f"Sharpe (net of {config.TRADING_COST_BPS}bps costs): {result['sharpe']:.2f} "
+                           f"(gross: {result['sharpe_gross']:.2f}), "
                            f"Sheaf-R²: {result['avg_reg_r2']:.4f}")
             else:
                 logger.warning(f"    {result['error']}")
 
+        # Best window is selected by RETURN-PREDICTION quality (correlation
+        # between predicted and actual returns), not by backtested Sharpe.
+        # Sharpe reflects realized P&L, which can look good even when a
+        # window's predictions barely explain anything -- e.g. a window
+        # whose predictions are nearly flat can still post a decent Sharpe
+        # just by riding the test period's market drift. Correlation
+        # directly measures whether the predictions themselves are good.
+        select_metric = config.BEST_WINDOW_METRIC
         if window_results:
-            best_window = max(window_results.items(), key=lambda x: x[1].get("sharpe", -999))
+            best_window = max(window_results.items(), key=lambda x: x[1].get(select_metric, -999))
             results["best_window"][universe_name] = {
                 "window": best_window[0],
-                "metrics": best_window[1]
+                "metrics": best_window[1],
+                "selected_by": select_metric,
             }
             logger.info(f"  ✅ Best window for {universe_name}: {best_window[0]} "
-                       f"(Sharpe: {best_window[1]['sharpe']:.2f})")
+                       f"(selected by {select_metric}={best_window[1][select_metric]:.4f}; "
+                       f"Sharpe: {best_window[1]['sharpe']:.2f})")
 
         results["backtest_results"][universe_name] = window_results
 
